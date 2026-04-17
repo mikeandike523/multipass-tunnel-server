@@ -1,0 +1,27 @@
+{
+  "keysFolder": "./keys",
+  "resolveRelativeMode": "cwd",
+  "machineKeys": {
+    "agent-vm": "./keys/agent-vm-special"
+  },
+  "tunnels": [
+    {
+      "machineName": "agent-vm",
+      "hostPort": 18789,
+      "vmPort": 18789
+    },
+    {
+      "machineName": "agent-vm",
+      "hostPort": 4000,
+      "vmPort": {
+        "portDiscoveryFile": "/home/ubuntu/.config/myapp/ports.json",
+        "portDiscoveryKey": "apiPort"
+      }
+    },
+    {
+      "machineName": "worker-vm",
+      "hostPort": 5000,
+      "vmPort": 5000
+    }
+  ]
+}
