@@ -178,7 +178,7 @@ class MachineSession {
       child.stdout.on('data', (b) => { stdout += b; });
       child.stderr.on('data', (b) => { stderr += b; });
       child.on('error', (err) => reject(new Error(`Failed to spawn multipass: ${err.message}`)));
-      child.on('close', (code) => {
+      child.on('close', async (code) => {
         if (code !== 0) {
           reject(new Error(`multipass info exited ${code}: ${stderr.trim()}`));
           return;
