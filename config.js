@@ -151,6 +151,10 @@ function loadConfig(configPath) {
     healthHost:                 process.env.HEALTH_HOST                        || '127.0.0.1',
     healthPort:                 Number(process.env.HEALTH_PORT                 || 18790),
     multipassBin:               process.env.MULTIPASS_BIN                      || '/snap/bin/multipass',
+    // Linux/QEMU Multipass uses mpqemubr0 as its host-side private bridge by default.
+    // The tunnel daemon validates discovered management IPs against this host interface.
+    multipassBridgeInterface:   process.env.MULTIPASS_BRIDGE_INTERFACE         || 'mpqemubr0',
+    ipBin:                      process.env.IP_BIN                              || '/usr/sbin/ip',
   };
 }
 
