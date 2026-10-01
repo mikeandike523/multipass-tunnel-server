@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const net = require('node:net');
 const { spawn } = require('node:child_process');
 const { Client } = require('ssh2');
 
@@ -177,7 +178,7 @@ class MachineSession {
       child.stdout.on('data', (b) => { stdout += b; });
       child.stderr.on('data', (b) => { stderr += b; });
       child.on('error', (err) => reject(new Error(`Failed to spawn multipass: ${err.message}`)));
-      child.on('close', (code) => {
+      child.on('close', async (code) => {
         if (code !== 0) {
           reject(new Error(`multipass info exited ${code}: ${stderr.trim()}`));
           return;
@@ -188,9 +189,111 @@ class MachineSession {
           if (!instance) throw new Error(`Instance "${this.machineName}" not in multipass output`);
           const ipv4 = (Array.isArray(instance.ipv4) ? instance.ipv4 : []).filter(Boolean);
           if (ipv4.length === 0) throw new Error(`No IPv4 address for instance "${this.machineName}"`);
-          resolve(ipv4[0]);
+
+          // Multipass places the instance management IPv4 first, followed by any additional
+          // addresses it discovers in the guest (for example Docker bridge addresses).
+          //
+          // On the Linux/QEMU backend used by this service, that first management address is
+          // resolved host-side from Multipass' dnsmasq lease for the VM's default NIC MAC.
+          // Keep selecting index 0 here deliberately; do not fall back to later addresses.
+          const managementIp = ipv4[0];
+
+          // Defense in depth: even though Multipass resolves the management address host-side,
+          // never let discovery redirect this daemon to an arbitrary host/LAN address. Require
+          // the candidate to belong to the host-controlled Multipass bridge subnet.
+          await this._assertIpOnMultipassBridge(managementIp);
+
+          resolve(managementIp);
         } catch (err) {
           reject(err);
+        }
+      });
+    });
+  }
+
+  /**
+   * Verify that a Multipass-discovered management IP belongs to the host-side
+   * Multipass bridge subnet. This is intentionally derived from host kernel state
+   * rather than from any guest command or guest-reported interface configuration.
+   *
+   * Fails closed if the bridge cannot be inspected or the candidate is invalid.
+   */
+  async _assertIpOnMultipassBridge(candidateIp) {
+    if (!net.isIPv4(candidateIp)) {
+      throw new Error(`Multipass management address is not valid IPv4: ${JSON.stringify(candidateIp)}`);
+    }
+
+    const { hostIp, prefixLen } = await this._getMultipassBridgeIpv4();
+
+    if (!isIpv4InSubnet(candidateIp, hostIp, prefixLen)) {
+      throw new Error(
+        `Refusing Multipass management IP ${candidateIp}: outside trusted bridge ` +
+        `${this.config.multipassBridgeInterface} (${hostIp}/${prefixLen})`
+      );
+    }
+
+    if (candidateIp === hostIp) {
+      throw new Error(
+        `Refusing Multipass management IP ${candidateIp}: it is the host bridge address`
+      );
+    }
+
+    if (isNetworkOrBroadcastAddress(candidateIp, hostIp, prefixLen)) {
+      throw new Error(
+        `Refusing Multipass management IP ${candidateIp}: network/broadcast address for ` +
+        `${hostIp}/${prefixLen}`
+      );
+    }
+  }
+
+  _getMultipassBridgeIpv4() {
+    return new Promise((resolve, reject) => {
+      const child = spawn(
+        this.config.ipBin,
+        ['-j', '-4', 'addr', 'show', 'dev', this.config.multipassBridgeInterface],
+        { stdio: ['ignore', 'pipe', 'pipe'] }
+      );
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', (b) => { stdout += b; });
+      child.stderr.on('data', (b) => { stderr += b; });
+      child.on('error', (err) => reject(
+        new Error(`Failed to inspect Multipass bridge: ${err.message}`)
+      ));
+
+      child.on('close', (code) => {
+        if (code !== 0) {
+          reject(new Error(
+            `${this.config.ipBin} exited ${code} while inspecting ` +
+            `${this.config.multipassBridgeInterface}: ${stderr.trim()}`
+          ));
+          return;
+        }
+
+        try {
+          const rows = JSON.parse(stdout);
+          const addrInfo = rows
+            .flatMap((row) => Array.isArray(row.addr_info) ? row.addr_info : [])
+            .find((addr) =>
+              addr.family === 'inet' &&
+              net.isIPv4(addr.local) &&
+              Number.isInteger(addr.prefixlen)
+            );
+
+          if (!addrInfo) {
+            throw new Error(
+              `No IPv4 CIDR found on Multipass bridge "${this.config.multipassBridgeInterface}"`
+            );
+          }
+
+          resolve({
+            hostIp: addrInfo.local,
+            prefixLen: addrInfo.prefixlen,
+          });
+        } catch (err) {
+          reject(new Error(`Failed to parse Multipass bridge address: ${err.message}`));
         }
       });
     });
@@ -454,3 +557,36 @@ function delay(ms) {
 }
 
 module.exports = { MachineSession };
+
+
+function ipv4ToUint32(ip) {
+  return ip.split('.').reduce(
+    (value, octet) => ((value << 8) | Number(octet)) >>> 0,
+    0
+  );
+}
+
+function subnetMask(prefixLen) {
+  if (!Number.isInteger(prefixLen) || prefixLen < 0 || prefixLen > 32) {
+    throw new Error(`Invalid IPv4 prefix length: ${prefixLen}`);
+  }
+  return prefixLen === 0 ? 0 : (0xffffffff << (32 - prefixLen)) >>> 0;
+}
+
+function isIpv4InSubnet(ip, subnetAddress, prefixLen) {
+  if (!net.isIPv4(ip) || !net.isIPv4(subnetAddress)) return false;
+  const mask = subnetMask(prefixLen);
+  return (ipv4ToUint32(ip) & mask) === (ipv4ToUint32(subnetAddress) & mask);
+}
+
+function isNetworkOrBroadcastAddress(ip, subnetAddress, prefixLen) {
+  // /31 and /32 have no traditional broadcast host exclusion.
+  if (prefixLen >= 31) return false;
+
+  const mask = subnetMask(prefixLen);
+  const subnet = ipv4ToUint32(subnetAddress) & mask;
+  const broadcast = (subnet | (~mask >>> 0)) >>> 0;
+  const value = ipv4ToUint32(ip);
+
+  return value === subnet || value === broadcast;
+}
